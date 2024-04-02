@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use dashmap::mapref::one::RefMut;
-use ethers::abi::{Address, Uint};
+use ethers::abi::{Address, Hash, Uint};
 use ethers::core::types::Log;
 use ethers::providers::{Http, Middleware, Provider};
+use ethers::types::transaction::eip2930::AccessList;
 use ethers::types::Bytes;
 use eyre::anyhow;
 use foundry_evm::CallKind;
@@ -13,69 +15,63 @@ use revm::primitives::bitvec::macros::internal::funty::Fundamental;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use warp::reject::custom;
 use warp::reply::Json;
 use warp::Rejection;
 
 use crate::errors::{
-    FromDecStrError, FromHexError, IncorrectChainIdError, InvalidBlockNumbersError,
-    MultipleChainIdsError, NoURLForChainIdError, StateNotFound,
+    IncorrectChainIdError, InvalidBlockNumbersError, MultipleChainIdsError, NoURLForChainIdError,
+    StateNotFound,
 };
+use crate::evm::StorageOverride;
 use crate::SharedSimulationState;
 
 use super::config::Config;
-use super::evm::Evm;
+use super::evm::{CallRawRequest, Evm};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SimulationRequest {
-    #[serde(rename = "chainId")]
     pub chain_id: u64,
     pub from: Address,
     pub to: Address,
     pub data: Option<Bytes>,
-    #[serde(rename = "gasLimit")]
     pub gas_limit: u64,
-    pub value: Option<String>,
-    #[serde(rename = "blockNumber")]
+    pub value: Option<PermissiveUint>,
+    pub access_list: Option<AccessList>,
     pub block_number: Option<u64>,
-    #[serde(rename = "formatTrace")]
+    pub block_timestamp: Option<u64>,
+    pub state_overrides: Option<HashMap<Address, StateOverride>>,
     pub format_trace: Option<bool>,
     #[serde(rename = "transactionBlockIndex")]
     pub transaction_block_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct SimulationResponse {
-    #[serde(rename = "simulationId")]
     pub simulation_id: u64,
-    #[serde(rename = "gasUsed")]
     pub gas_used: u64,
-    #[serde(rename = "blockNumber")]
     pub block_number: u64,
     pub success: bool,
     pub trace: Vec<CallTrace>,
-    #[serde(rename = "formattedTrace")]
     pub formatted_trace: Option<String>,
     pub logs: Vec<Log>,
-    #[serde(rename = "exitReason")]
     pub exit_reason: InstructionResult,
-    #[serde(rename = "returnData")]
     pub return_data: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StatefulSimulationRequest {
-    #[serde(rename = "chainId")]
     pub chain_id: u64,
-    #[serde(rename = "gasLimit")]
     pub gas_limit: u64,
-    #[serde(rename = "blockNumber")]
     pub block_number: Option<u64>,
+    pub block_timestamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct StatefulSimulationResponse {
-    #[serde(rename = "statefulSimulationId")]
     pub stateful_simulation_id: Uuid,
 }
 
@@ -85,12 +81,76 @@ pub struct StatefulSimulationEndResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StateOverride {
+    pub balance: Option<PermissiveUint>,
+    pub nonce: Option<u64>,
+    pub code: Option<Bytes>,
+    #[serde(flatten)]
+    pub state: Option<State>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum State {
+    Full {
+        state: HashMap<Hash, PermissiveUint>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Diff {
+        state_diff: HashMap<Hash, PermissiveUint>,
+    },
+}
+
+impl From<State> for StorageOverride {
+    fn from(value: State) -> Self {
+        let (slots, diff) = match value {
+            State::Full { state } => (state, false),
+            State::Diff { state_diff } => (state_diff, true),
+        };
+
+        StorageOverride {
+            slots: slots
+                .into_iter()
+                .map(|(key, value)| (key, value.into()))
+                .collect(),
+            diff,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct CallTrace {
-    #[serde(rename = "callType")]
     pub call_type: CallKind,
     pub from: Address,
     pub to: Address,
     pub value: Uint,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq)]
+#[serde(transparent)]
+pub struct PermissiveUint(pub Uint);
+
+impl From<PermissiveUint> for Uint {
+    fn from(value: PermissiveUint) -> Self {
+        value.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PermissiveUint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept value in hex or decimal formats
+        let value = String::deserialize(deserializer)?;
+        let parsed = if value.starts_with("0x") {
+            Uint::from_str(&value).map_err(serde::de::Error::custom)?
+        } else {
+            Uint::from_dec_str(&value).map_err(serde::de::Error::custom)?
+        };
+        Ok(Self(parsed))
+    }
 }
 
 fn chain_id_to_fork_url(chain_id: u64) -> Result<String, Rejection> {
@@ -128,36 +188,28 @@ async fn run(
     transaction: SimulationRequest,
     commit: bool,
 ) -> Result<SimulationResponse, Rejection> {
-    // Accept value in hex or decimal formats
-    let value = if let Some(value) = transaction.value {
-        if value.starts_with("0x") {
-            Some(Uint::from_str(value.as_str()).map_err(|_err| custom(FromHexError))?)
-        } else {
-            Some(Uint::from_dec_str(value.as_str()).map_err(|_err| custom(FromDecStrError))?)
-        }
-    } else {
-        None
-    };
+    for (address, state_override) in transaction.state_overrides.into_iter().flatten() {
+        evm.override_account(
+            address,
+            state_override.balance.map(Uint::from),
+            state_override.nonce,
+            state_override.code,
+            state_override.state.map(StorageOverride::from),
+        )?;
+    }
 
+    let call = CallRawRequest {
+        from: transaction.from,
+        to: transaction.to,
+        value: transaction.value.map(Uint::from),
+        data: transaction.data,
+        access_list: transaction.access_list,
+        format_trace: transaction.format_trace.unwrap_or_default(),
+    };
     let result = if commit {
-        evm.call_raw_committing(
-            transaction.from,
-            transaction.to,
-            value,
-            transaction.data,
-            transaction.gas_limit,
-            transaction.format_trace.unwrap_or_default(),
-        )
-        .await?
+        evm.call_raw_committing(call, transaction.gas_limit).await?
     } else {
-        evm.call_raw(
-            transaction.from,
-            transaction.to,
-            value,
-            transaction.data,
-            transaction.format_trace.unwrap_or_default(),
-        )
-        .await?
+        evm.call_raw(call).await?
     };
 
     Ok(SimulationResponse {
@@ -196,6 +248,12 @@ pub async fn simulate(transaction: SimulationRequest, config: Config) -> Result<
         return Err(warp::reject::custom(IncorrectChainIdError()));
     }
 
+    if let Some(timestamp) = transaction.block_timestamp {
+        evm.set_block_timestamp(timestamp)
+            .await
+            .expect("failed to set block timestamp");
+    }
+
     let response: SimulationResponse = if transaction.transaction_block_index.is_some() {
         let mut arr_resp = Vec::with_capacity(1);
         apply_block_transactions(&fork_url, &transaction, &mut evm, &mut arr_resp).await?;
@@ -216,6 +274,7 @@ pub async fn simulate_bundle(
 ) -> Result<Json, Rejection> {
     let first_chain_id = transactions[0].chain_id;
     let first_block_number = transactions[0].block_number;
+    let first_block_timestamp = transactions[0].block_timestamp;
 
     let fork_url = config
         .fork_url
@@ -231,6 +290,12 @@ pub async fn simulate_bundle(
 
     if evm.get_chain_id() != Uint::from(first_chain_id) {
         return Err(warp::reject::custom(IncorrectChainIdError()));
+    }
+
+    if let Some(timestamp) = first_block_timestamp {
+        evm.set_block_timestamp(timestamp)
+            .await
+            .expect("failed to set block timestamp");
     }
 
     let mut response = Vec::with_capacity(transactions.len());
@@ -289,7 +354,7 @@ async fn apply_block_transactions(
             chain_id: x.chain_id.unwrap().as_u64(),
             from: x.from,
             to: x.to.unwrap(),
-            value: Some(x.value.to_string()),
+            value: Some(x.value.into()),
             data: Some(x.input.clone()),
             gas_limit: x.gas.as_u64(),
             block_number: None,
@@ -325,7 +390,7 @@ pub async fn simulate_stateful_new(
     let fork_url = config
         .fork_url
         .unwrap_or(chain_id_to_fork_url(stateful_simulation_request.chain_id)?);
-    let evm = Evm::new(
+    let mut evm = Evm::new(
         None,
         fork_url,
         stateful_simulation_request.block_number,
@@ -333,6 +398,11 @@ pub async fn simulate_stateful_new(
         true,
         config.etherscan_key,
     );
+
+    if let Some(timestamp) = stateful_simulation_request.block_timestamp {
+        evm.set_block_timestamp(timestamp).await?;
+    }
+
     let new_id = Uuid::new_v4();
     state.evms.insert(new_id, Arc::new(Mutex::new(evm)));
 

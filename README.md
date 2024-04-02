@@ -1,8 +1,8 @@
-# Enso Transaction 🧐 Simulator 🧐
+# Temper
 
-A simple API which simulates a given transaction request.
+**Temper is an Ethereum Transaction Simulator. It provides a super simple HTTP API which simulates a given transaction request against a local EVM.**
 
-[![test](https://github.com/EnsoFinance/transaction-simulator/actions/workflows/test.yaml/badge.svg)](https://github.com/EnsoFinance/transaction-simulator/actions/workflows/test.yaml)
+[![test](https://github.com/EnsoFinance/temper/actions/workflows/test.yaml/badge.svg)](https://github.com/EnsoFinance/temper/actions/workflows/test.yaml)
 
 ![cover](cover.jpg)
 
@@ -232,8 +232,24 @@ export type SimulationRequest = {
   data?: string;
   gasLimit: number;
   value: string;
+  accessList?: AccessListItem[];
   blockNumber?: number; // if not specified, latest used,
+  blockTimestamp?: number; // if not specified, timestamp of latest block is used,
+  stateOverrides?: Record<string, StateOverride>;
   formatTrace?: boolean;
+};
+
+export type AccessListItem = {
+  address: string;
+  storageKeys: string[];
+};
+
+export type StateOverride = {
+  balance?: string;
+  nonce?: number;
+  code?: string;
+  state?: Record<string, string>;
+  stateDiff?: Record<string, string>;
 };
 
 export type SimulationResponse = {
