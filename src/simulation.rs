@@ -20,7 +20,7 @@ use warp::Rejection;
 
 use crate::errors::{
     IncorrectChainIdError, InvalidBlockNumbersError, MultipleChainIdsError, NoURLForChainIdError,
-    StateNotFound,
+    StateNotFound, RpcError
 };
 use crate::evm::StorageOverride;
 use crate::SharedSimulationState;
@@ -336,7 +336,12 @@ async fn apply_block_transactions(
     response: &mut Vec<SimulationResponse>,
 ) -> Result<(), Rejection> {
     let provider = Provider::<Http>::try_from(fork_url);
-    let pre_transactions = provider
+
+    if provider.is_err() {
+        return Err(warp::reject::custom(NoURLForChainIdError));
+    }
+
+    let block_transactions = provider
         .unwrap()
         .get_block_with_txs(
             transaction
@@ -344,10 +349,20 @@ async fn apply_block_transactions(
                 .block_number
                 .expect("Transaction has no block number"),
         )
-        .await
-        .unwrap()
-        .unwrap();
-    let relevant_transactions: Vec<_> = pre_transactions
+        .await;
+    if block_transactions.is_err() {
+        return Err(warp::reject::custom(RpcError()));
+    }
+    let block_transactions = block_transactions.unwrap();
+
+    if block_transactions.is_none() {
+        response.push(run(evm, transaction.clone(), true).await?);
+        return Ok(());
+    }
+
+    let block_transactions = block_transactions.unwrap();
+
+    let simulation_transactions: Vec<_> = block_transactions
         .transactions
         .iter()
         .map(|x| SimulationRequest {
@@ -365,12 +380,12 @@ async fn apply_block_transactions(
             state_overrides: None,
         })
         .collect();
-    let transaction_block_index = transaction.clone().transaction_block_index.unwrap();
-    let transactions_before_index = relevant_transactions
+    let transaction_block_index = transaction.transaction_block_index.unwrap();
+    let transactions_before_index = simulation_transactions
         .iter()
         .take(transaction_block_index.as_usize())
         .collect::<Vec<_>>();
-    let transactions_after_index = relevant_transactions
+    let transactions_after_index = simulation_transactions
         .iter()
         .skip(transaction_block_index.as_usize());
     for before_tx in transactions_before_index {
