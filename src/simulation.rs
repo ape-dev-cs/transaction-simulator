@@ -354,12 +354,15 @@ async fn apply_block_transactions(
             chain_id: x.chain_id.unwrap().as_u64(),
             from: x.from,
             to: x.to.unwrap(),
-            value: Some(x.value.into()),
+            value: Some(PermissiveUint(x.value)),
             data: Some(x.input.clone()),
             gas_limit: x.gas.as_u64(),
             block_number: None,
             format_trace: None,
             transaction_block_index: None,
+            access_list: None,
+            block_timestamp: None,
+            state_overrides: None,
         })
         .collect();
     let transaction_block_index = transaction.clone().transaction_block_index.unwrap();
